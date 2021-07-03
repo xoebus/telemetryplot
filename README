@@ -1,0 +1,7 @@
+# iracing telemetry plotter
+
+## usage
+
+    go run main.go -telemetry trace.ibt -lap 5 > trace.dat
+    gnuplot trace.plot > trace.png
+    open trace.png
