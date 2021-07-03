@@ -1,23 +1,44 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 )
 
+var (
+	telemetryFile = flag.String("telemetry", "", "path to telemetry file")
+	lap           = flag.Int("lap", 1, "lap data to extract")
+)
+
+const (
+	TelemetryHeaderSize = 112
+	DiskHeaderSize      = 32
+	VarsHeaderSize      = 144
+)
+
 func main() {
-	bs, err := ioutil.ReadFile("mx5.ibt")
+	flag.Parse()
+
+	if *telemetryFile == "" {
+		fmt.Fprintln(os.Stderr, "-telemetry must be set")
+		os.Exit(1)
+	}
+
+	f, err := os.Open(*telemetryFile)
 	if err != nil {
 		log.Fatalf("failed to open file: %v", err)
 	}
+	defer f.Close()
 
-	parse(bs)
+	if err := parse(f, *lap); err != nil {
+		log.Fatalf("failed to parse file: %v", err)
+	}
 }
 
 type TelemetryHeader struct {
@@ -68,124 +89,160 @@ func (v VarHeader) Unit() string {
 	return strings.ReplaceAll(string(v.Stuff[96:128]), "\x00", "")
 }
 
-func parse(bs []byte) {
-	headerBytes := make([]byte, 112)
-	if _, err := io.ReadFull(r(bs[:112]), headerBytes); err != nil {
-		log.Fatal(err)
+type VarDef struct {
+	Type reflect.Type
+}
+
+func (v VarDef) Size() int64 {
+	return int64(v.Type.Bits()) / 8
+}
+
+var varMap = map[int32]VarDef{
+	2: {
+		Type: reflect.TypeOf(int32(0)),
+	},
+	4: {
+		Type: reflect.TypeOf(float32(0)),
+	},
+	5: {
+		Type: reflect.TypeOf(float64(0)),
+	},
+}
+
+func parse(r io.ReaderAt, useLap int) error {
+	sr := func(offset, n int64) *io.SectionReader {
+		return io.NewSectionReader(r, offset, n)
 	}
+
 	var header TelemetryHeader
-	if err := binary.Read(bytes.NewReader(headerBytes), binary.LittleEndian, &header); err != nil {
-		log.Fatal(err)
+	if err := binary.Read(sr(0, TelemetryHeaderSize), binary.LittleEndian, &header); err != nil {
+		return err
 	}
-	fmt.Printf("%#v\n", header)
 
-	diskHeaderBytes := make([]byte, 32)
-	if _, err := io.ReadFull(r(bs[112:112+32]), diskHeaderBytes); err != nil {
-		log.Fatal(err)
-	}
 	var diskHeader DiskHeader
-	if err := binary.Read(bytes.NewReader(diskHeaderBytes), binary.LittleEndian, &diskHeader); err != nil {
-		log.Fatal(err)
+	if err := binary.Read(sr(0, DiskHeaderSize), binary.LittleEndian, &diskHeader); err != nil {
+		return err
 	}
-	fmt.Printf("%#v\n", diskHeader)
 
-	sessionInfo := make([]byte, header.SessionInfoLength)
-	if _, err := io.ReadFull(r(bs[header.SessionInfoOffset:header.SessionInfoOffset+header.SessionInfoLength]), sessionInfo); err != nil {
-		log.Fatal(err)
-	}
+	// TODO: Work out how to parse session info
+	// sessionInfo := make([]byte, header.SessionInfoLength)
+	// if _, err := io.ReadFull(r(bs[header.SessionInfoOffset:header.SessionInfoOffset+header.SessionInfoLength]), sessionInfo); err != nil {
+	// 	log.Fatal(err)
+	// }
 	// fmt.Printf("%s\n", string(sessionInfo))
 
-	varHeaders := []VarHeader{}
+	vars := make(map[string]VarHeader, header.NumVars)
 	for i := 0; i < int(header.NumVars); i++ {
-		start := i * 144
-		end := start + 144
+		start := int64(i) * VarsHeaderSize
 		var varHeader VarHeader
-		if err := binary.Read(r(bs[start:end]), binary.LittleEndian, &varHeader); err != nil {
-			log.Fatal(err)
+		if err := binary.Read(sr(start, VarsHeaderSize), binary.LittleEndian, &varHeader); err != nil {
+			return err
 		}
-		varHeaders = append(varHeaders, varHeader)
-	}
-	for _, varHeader := range varHeaders {
-		fmt.Printf("%#v\n", varHeader.Name())
-		fmt.Printf("%#v\n", varHeader.Description())
-		fmt.Printf("%#v\n", varHeader.Unit())
-		fmt.Printf("%#v\n", varHeader.Type)
-		fmt.Println()
+		name := strings.ToLower(varHeader.Name())
+		vars[name] = varHeader
 	}
 
-	varMap := make(map[string]VarHeader)
-	for _, varHeader := range varHeaders[1:] { // TODO: why is the first record corrupted?
-		varMap[strings.ToLower(varHeader.Name())] = varHeader
-	}
-
-	trace, err := os.Create("trace.dat")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer trace.Close()
-	w := io.MultiWriter(trace, os.Stdout)
-
+	foundSamples := false
 	count := 0
 	for {
-		start := header.BufOffset + (int32(count) * header.BufLen)
-		end := start + header.BufLen
-		if int(end) > len(bs) {
+		start := int64(header.BufOffset) + (int64(count) * int64(header.BufLen))
+		varReader := sr(start, int64(header.BufLen))
+
+		lap, done, err := extractVar(varReader, vars, "lap")
+		if err != nil {
+			return err
+		}
+		if done {
 			break
 		}
-		buf := bs[start:end]
 
-		lap := varMap["lap"]
-		// fmt.Println(lap.Type)
-		lapSize := int32(4)
-		lapBuf := buf[lap.Offset : lap.Offset+lapSize]
-		var lapInt int32
-		if err := binary.Read(r(lapBuf), binary.LittleEndian, &lapInt); err != nil {
-			log.Fatal(err)
+		sessionTime, done, err := extractVar(varReader, vars, "sessiontime")
+		if err != nil {
+			return err
+		}
+		if done {
+			break
 		}
 
-		sessionTime := varMap["sessiontime"]
-		// fmt.Println(sessionTime.Type)
-		doubleSize := int32(8)
-		timeBuf := buf[sessionTime.Offset : sessionTime.Offset+doubleSize]
-		var timeDouble float64
-		if err := binary.Read(r(timeBuf), binary.LittleEndian, &timeDouble); err != nil {
-			log.Fatal(err)
+		speed, done, err := extractVar(varReader, vars, "speed")
+		if err != nil {
+			return err
+		}
+		if done {
+			break
 		}
 
-		speed := varMap["speed"]
-		// fmt.Println(speed.Type)
-		size := int32(4)
-		speedBuf := buf[speed.Offset : speed.Offset+size]
-		var speedFloat float32
-		if err := binary.Read(r(speedBuf), binary.LittleEndian, &speedFloat); err != nil {
-			log.Fatal(err)
+		throttle, done, err := extractVar(varReader, vars, "throttle")
+		if err != nil {
+			return err
 		}
-		// fmt.Println("speed:", timeDouble, speedFloat)
-
-		throttle := varMap["throttle"]
-		throttleSize := int32(4)
-		throttleBuf := buf[throttle.Offset : throttle.Offset+throttleSize]
-		var throttleFloat float32
-		if err := binary.Read(r(throttleBuf), binary.LittleEndian, &throttleFloat); err != nil {
-			log.Fatal(err)
+		if done {
+			break
 		}
 
-		brake := varMap["brake"]
-		brakeSize := int32(4)
-		brakeBuf := buf[brake.Offset : brake.Offset+brakeSize]
-		var brakeFloat float32
-		if err := binary.Read(r(brakeBuf), binary.LittleEndian, &brakeFloat); err != nil {
-			log.Fatal(err)
+		brake, done, err := extractVar(varReader, vars, "brake")
+		if err != nil {
+			return err
+		}
+		if done {
+			break
 		}
 
-		// if lapInt == 6 {
-		fmt.Fprintln(w, timeDouble, speedFloat, throttleFloat, brakeFloat)
-		// }
+		if lap.(int32) == int32(useLap) {
+			foundSamples = true
+			fmt.Println(sessionTime, speed, throttle, brake)
+		}
 
 		count++
 	}
+
+	if !foundSamples {
+		fmt.Println("no samples found for that lap, try a different one")
+	}
+
+	return nil
 }
 
-func r(bs []byte) io.Reader {
-	return bytes.NewReader(bs)
+func extractVar(r io.ReaderAt, vars map[string]VarHeader, name string) (interface{}, bool, error) {
+	lapVar, found := vars[name]
+	if !found {
+		return nil, false, fmt.Errorf("variable name not found: %s", name)
+	}
+	typ, found := varMap[lapVar.Type]
+	if !found {
+		return nil, false, fmt.Errorf("type not found: %d", lapVar.Type)
+	}
+	varReader := io.NewSectionReader(r, int64(lapVar.Offset), typ.Size())
+
+	switch typ.Type.Kind() {
+	case reflect.Int32:
+		var val int32
+		if err := binary.Read(varReader, binary.LittleEndian, &val); err != nil {
+			if err == io.EOF {
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+		return val, false, nil
+	case reflect.Float32:
+		var val float32
+		if err := binary.Read(varReader, binary.LittleEndian, &val); err != nil {
+			if err == io.EOF {
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+		return val, false, nil
+	case reflect.Float64:
+		var val float64
+		if err := binary.Read(varReader, binary.LittleEndian, &val); err != nil {
+			if err == io.EOF {
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+		return val, false, nil
+	default:
+		panic(typ.Type.Kind())
+	}
 }
