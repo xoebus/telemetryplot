@@ -156,7 +156,7 @@ func parse(r io.ReaderAt, useLap int) error {
 			break
 		}
 
-		sessionTime, done, err := extractVar(varReader, vars, "sessiontime")
+		lapDist, done, err := extractVar(varReader, vars, "lapdist")
 		if err != nil {
 			return err
 		}
@@ -190,7 +190,7 @@ func parse(r io.ReaderAt, useLap int) error {
 
 		if lap.(int32) == int32(useLap) {
 			foundSamples = true
-			fmt.Println(sessionTime, speed, throttle, brake)
+			fmt.Println(lapDist, speed, throttle, brake)
 		}
 
 		count++
